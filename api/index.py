@@ -11,7 +11,9 @@ Changes from polling version:
 
 import asyncio
 import concurrent.futures
+import csv
 import html as _html
+import io
 import logging
 import os
 import socket
@@ -31,6 +33,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -499,6 +502,9 @@ def kb_admin_main() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📊 Statistics",       callback_data="admin_stats"),
             InlineKeyboardButton(text="📣 Broadcast",        callback_data="admin_broadcast"),
+        ],
+        [
+            InlineKeyboardButton(text="📄 Generate CSV",     callback_data="generate_csv"),
         ],
     ])
 
@@ -2572,6 +2578,78 @@ async def handle_fallback(message: Message, state: FSMContext) -> None:
         await message.answer("Use the panel below:", reply_markup=kb_admin_main())
     else:
         await message.answer("Use the menu below:", reply_markup=kb_user_main())
+
+
+# ─────────────────────────────────────────────
+#  ADMIN — GENERATE CSV FOR ADOBE STOCK
+# ─────────────────────────────────────────────
+
+@router.callback_query(F.data == "generate_csv")
+async def cb_generate_csv(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id != ADMIN_CHAT_ID:
+        await callback.answer("Unauthorized.", show_alert=True)
+        return
+
+    try:
+        await callback.answer("⏳ Generating CSV…")
+    except Exception:
+        pass
+
+    # Fetch ONLY downloaded submissions — no status changes made here
+    all_subs = await DB.get_all_submissions()
+    downloaded = sorted(
+        [v for v in all_subs.values() if isinstance(v, dict) and v.get("status") == "downloaded"],
+        key=lambda x: x.get("downloaded_at", x.get("date", "")),
+    )
+
+    if not downloaded:
+        await callback.message.answer(
+            "📄 <b>Generate CSV</b>\n\n"
+            "❌ Downloaded List is empty.\n"
+            "Mark images as Downloaded first, then generate CSV.",
+            parse_mode="HTML",
+            reply_markup=kb_admin_main(),
+        )
+        return
+
+    # ── Build CSV in memory ───────────────────────────────────────────────
+    # Adobe Stock required columns (case-sensitive, exact order)
+    output = io.StringIO()
+    writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
+
+    # EXACT headers required by Adobe Stock
+    writer.writerow(["Filename", "Title", "Keywords", "Category", "Releases"])
+
+    for sub in downloaded:
+        writer.writerow([
+            sub.get("file_name", ""),   # EXACT original filename (e.g. IMG_123.jpg)
+            sub.get("title",     ""),   # Title saved at upload time
+            sub.get("keywords",  ""),   # Keywords saved at upload time
+            "",                          # Category — blank as required
+            "",                          # Releases — blank as required
+        ])
+
+    # UTF-8 with BOM so Excel / Adobe Stock opens it correctly
+    csv_bytes = output.getvalue().encode("utf-8-sig")
+    output.close()
+
+    # ── Send CSV as document to admin chat ───────────────────────────────
+    timestamp = _now().replace(" ", "_").replace(":", "-")
+    filename  = f"adobe_stock_{timestamp}.csv"
+
+    await bot.send_document(
+        chat_id  = ADMIN_CHAT_ID,
+        document = BufferedInputFile(file=csv_bytes, filename=filename),
+        caption  = (
+            f"📄 <b>Adobe Stock CSV</b>\n\n"
+            f"✅ <b>{len(downloaded)}</b> items exported from Downloaded List.\n"
+            f"📅 Generated: {_now()}"
+        ),
+        parse_mode = "HTML",
+    )
+    logger.info("CSV generated: %s items → %s", len(downloaded), filename)
+
+
 
 
 # ─────────────────────────────────────────────
