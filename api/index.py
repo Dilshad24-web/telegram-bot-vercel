@@ -7,6 +7,13 @@ Changes from polling version:
 - Removed start_polling loop → FastAPI webhook endpoint
 - Bot/Dispatcher initialized at module level (Vercel warm-start safe)
 - All core logic (Downloaded List, Admin Panel, FSM flows) UNCHANGED
+
+NEW FEATURE ADDED:
+- Bulk CSV Generation for Adobe Stock
+  → Admin Panel → "📄 Generate CSV"
+  → Fetches only "downloaded" items from Firebase
+  → Generates CSV with exact Adobe Stock headers
+  → Sends CSV as document to admin; NO status changes / deletions
 """
 
 import asyncio
@@ -2566,6 +2573,84 @@ async def cb_reject_wd(callback: CallbackQuery, bot: Bot) -> None:
 
 
 # ─────────────────────────────────────────────
+#  ADMIN — GENERATE CSV FOR ADOBE STOCK  ← NEW
+# ─────────────────────────────────────────────
+
+@router.callback_query(F.data == "generate_csv")
+async def cb_generate_csv(callback: CallbackQuery) -> None:
+    """
+    Fetches ONLY items with status == "downloaded" from Firebase,
+    builds a CSV with Adobe Stock's exact required headers, and sends
+    it as a document to the admin.
+
+    IMPORTANT: This handler performs NO status changes, NO deletions.
+    The Downloaded List remains completely intact after CSV generation.
+    """
+    if callback.from_user.id != ADMIN_CHAT_ID:
+        await callback.answer("Unauthorized.", show_alert=True)
+        return
+
+    try:
+        await callback.answer("⏳ Generating CSV…")
+    except Exception:
+        pass
+
+    # ── Fetch only downloaded submissions — read-only, no DB changes ──────
+    all_subs = await DB.get_all_submissions()
+    downloaded = sorted(
+        [v for v in all_subs.values() if isinstance(v, dict) and v.get("status") == "downloaded"],
+        key=lambda x: x.get("downloaded_at", x.get("date", "")),
+    )
+
+    if not downloaded:
+        await callback.message.answer(
+            "📄 <b>Generate CSV</b>\n\n"
+            "❌ Downloaded List is empty.\n"
+            "Mark images as Downloaded first, then generate the CSV.",
+            parse_mode="HTML",
+            reply_markup=kb_admin_main(),
+        )
+        return
+
+    # ── Build CSV entirely in memory (no disk I/O needed on Vercel) ───────
+    output = io.StringIO()
+    writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
+
+    # Exact, case-sensitive Adobe Stock column headers
+    writer.writerow(["Filename", "Title", "Keywords", "Category", "Releases"])
+
+    for sub in downloaded:
+        writer.writerow([
+            sub.get("file_name", ""),  # EXACT original filename (e.g. my_photo.jpg)
+            sub.get("title",     ""),  # Title entered by user at upload time
+            sub.get("keywords",  ""),  # Keywords entered by user at upload time
+            "",                         # Category — left blank as required
+            "",                         # Releases — left blank as required
+        ])
+
+    # UTF-8 with BOM so Excel and Adobe Stock open it correctly
+    csv_bytes = output.getvalue().encode("utf-8-sig")
+    output.close()
+
+    # ── Send as document to admin — no status changes after this ──────────
+    timestamp = _now().replace(" ", "_").replace(":", "-")
+    filename  = f"adobe_stock_{timestamp}.csv"
+
+    await bot.send_document(
+        chat_id  = ADMIN_CHAT_ID,
+        document = BufferedInputFile(file=csv_bytes, filename=filename),
+        caption  = (
+            f"📄 <b>Adobe Stock CSV</b>\n\n"
+            f"✅ <b>{len(downloaded)}</b> items exported from Downloaded List.\n"
+            f"📅 Generated: {_now()}\n\n"
+            f"<i>Downloaded List is untouched — approve/reject manually as usual.</i>"
+        ),
+        parse_mode = "HTML",
+    )
+    logger.info("CSV generated: %s items → %s", len(downloaded), filename)
+
+
+# ─────────────────────────────────────────────
 #  FALLBACK HANDLER
 # ─────────────────────────────────────────────
 
@@ -2578,78 +2663,6 @@ async def handle_fallback(message: Message, state: FSMContext) -> None:
         await message.answer("Use the panel below:", reply_markup=kb_admin_main())
     else:
         await message.answer("Use the menu below:", reply_markup=kb_user_main())
-
-
-# ─────────────────────────────────────────────
-#  ADMIN — GENERATE CSV FOR ADOBE STOCK
-# ─────────────────────────────────────────────
-
-@router.callback_query(F.data == "generate_csv")
-async def cb_generate_csv(callback: CallbackQuery, bot: Bot) -> None:
-    if callback.from_user.id != ADMIN_CHAT_ID:
-        await callback.answer("Unauthorized.", show_alert=True)
-        return
-
-    try:
-        await callback.answer("⏳ Generating CSV…")
-    except Exception:
-        pass
-
-    # Fetch ONLY downloaded submissions — no status changes made here
-    all_subs = await DB.get_all_submissions()
-    downloaded = sorted(
-        [v for v in all_subs.values() if isinstance(v, dict) and v.get("status") == "downloaded"],
-        key=lambda x: x.get("downloaded_at", x.get("date", "")),
-    )
-
-    if not downloaded:
-        await callback.message.answer(
-            "📄 <b>Generate CSV</b>\n\n"
-            "❌ Downloaded List is empty.\n"
-            "Mark images as Downloaded first, then generate CSV.",
-            parse_mode="HTML",
-            reply_markup=kb_admin_main(),
-        )
-        return
-
-    # ── Build CSV in memory ───────────────────────────────────────────────
-    # Adobe Stock required columns (case-sensitive, exact order)
-    output = io.StringIO()
-    writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
-
-    # EXACT headers required by Adobe Stock
-    writer.writerow(["Filename", "Title", "Keywords", "Category", "Releases"])
-
-    for sub in downloaded:
-        writer.writerow([
-            sub.get("file_name", ""),   # EXACT original filename (e.g. IMG_123.jpg)
-            sub.get("title",     ""),   # Title saved at upload time
-            sub.get("keywords",  ""),   # Keywords saved at upload time
-            "",                          # Category — blank as required
-            "",                          # Releases — blank as required
-        ])
-
-    # UTF-8 with BOM so Excel / Adobe Stock opens it correctly
-    csv_bytes = output.getvalue().encode("utf-8-sig")
-    output.close()
-
-    # ── Send CSV as document to admin chat ───────────────────────────────
-    timestamp = _now().replace(" ", "_").replace(":", "-")
-    filename  = f"adobe_stock_{timestamp}.csv"
-
-    await bot.send_document(
-        chat_id  = ADMIN_CHAT_ID,
-        document = BufferedInputFile(file=csv_bytes, filename=filename),
-        caption  = (
-            f"📄 <b>Adobe Stock CSV</b>\n\n"
-            f"✅ <b>{len(downloaded)}</b> items exported from Downloaded List.\n"
-            f"📅 Generated: {_now()}"
-        ),
-        parse_mode = "HTML",
-    )
-    logger.info("CSV generated: %s items → %s", len(downloaded), filename)
-
-
 
 
 # ─────────────────────────────────────────────
