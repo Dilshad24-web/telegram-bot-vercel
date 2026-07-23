@@ -7,11 +7,19 @@ Changes from polling version:
 - Removed start_polling loop → FastAPI webhook endpoint
 - Bot/Dispatcher initialized at module level (Vercel warm-start safe)
 - All core logic (Downloaded List, Admin Panel, FSM flows) UNCHANGED
+
+FSM FIX (serverless):
+- FirebaseFSMStorage persists FSM state/data in Firebase Realtime DB
+  so state survives across cold/warm Vercel invocations.
+- Fixed missing await state.set_state(WithdrawStates.confirming) in
+  handle_upi_id so the confirm_wd callback filter matches correctly.
 """
 
 import asyncio
 import concurrent.futures
+import csv
 import html as _html
+import io
 import logging
 import os
 import socket
@@ -31,6 +39,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -382,6 +391,10 @@ class DB:
 #  FSM states are stored under Firebase path:
 #    fsm/{bot_id}/{chat_id}/{user_id}/state
 #    fsm/{bot_id}/{chat_id}/{user_id}/data
+#
+#  IMPORTANT: Every operation logs its path and
+#  retries once on failure to prevent silent state
+#  loss on Vercel cold-starts / transient errors.
 # ─────────────────────────────────────────────
 
 class FirebaseFSMStorage(BaseStorage):
@@ -405,21 +418,59 @@ class FirebaseFSMStorage(BaseStorage):
     async def set_state(self, key: StorageKey, state: StateType = None) -> None:
         path = f"{self._path(key)}/state"
         if state is None:
-            await fb_set(path, None)
+            ok = await fb_set(path, None)
+            if not ok:
+                logger.warning("FSM set_state RETRY: clearing state at [%s]", path)
+                ok = await fb_set(path, None)
+            if not ok:
+                logger.error("FSM set_state FAILED: could not clear state at [%s]", path)
+            else:
+                logger.debug("FSM set_state: cleared [%s]", path)
         else:
             state_str = state.state if hasattr(state, "state") else str(state)
-            await fb_set(path, state_str)
+            ok = await fb_set(path, state_str)
+            if not ok:
+                logger.warning("FSM set_state RETRY: [%s] → %s", path, state_str)
+                ok = await fb_set(path, state_str)
+            if not ok:
+                logger.error("FSM set_state FAILED: [%s] → %s — STATE WILL BE LOST!", path, state_str)
+            else:
+                logger.info("FSM set_state OK: [%s] → %s", path, state_str)
 
     async def get_state(self, key: StorageKey) -> Optional[str]:
-        val = await fb_get(f"{self._path(key)}/state")
+        path = f"{self._path(key)}/state"
+        val = await fb_get(path)
+        if val is None:
+            logger.debug("FSM get_state: [%s] → None (no active state)", path)
+        elif isinstance(val, str):
+            logger.info("FSM get_state: [%s] → %s", path, val)
+        else:
+            logger.warning("FSM get_state: [%s] → unexpected type %s: %r", path, type(val).__name__, val)
         return val if isinstance(val, str) else None
 
     async def set_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
-        await fb_set(f"{self._path(key)}/data", data or {})
+        path = f"{self._path(key)}/data"
+        payload = data if data else {}
+        ok = await fb_set(path, payload)
+        if not ok:
+            logger.warning("FSM set_data RETRY: [%s] keys=%s", path, list(payload.keys()) if payload else "{}")
+            ok = await fb_set(path, payload)
+        if not ok:
+            logger.error("FSM set_data FAILED: [%s] — DATA WILL BE LOST!", path)
+        else:
+            logger.debug("FSM set_data OK: [%s] keys=%s", path, list(payload.keys()) if payload else "{}")
 
     async def get_data(self, key: StorageKey) -> Dict[str, Any]:
-        result = await fb_get(f"{self._path(key)}/data")
-        return result if isinstance(result, dict) else {}
+        path = f"{self._path(key)}/data"
+        result = await fb_get(path)
+        if result is None:
+            logger.debug("FSM get_data: [%s] → None (returning empty dict)", path)
+            return {}
+        if isinstance(result, dict):
+            logger.debug("FSM get_data: [%s] → keys=%s", path, list(result.keys()))
+            return result
+        logger.warning("FSM get_data: [%s] → unexpected type %s: %r (returning empty dict)", path, type(result).__name__, result)
+        return {}
 
     async def close(self) -> None:
         pass  # Nothing to close — Firebase is stateless HTTP
@@ -499,6 +550,9 @@ def kb_admin_main() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📊 Statistics",       callback_data="admin_stats"),
             InlineKeyboardButton(text="📣 Broadcast",        callback_data="admin_broadcast"),
+        ],
+        [
+            InlineKeyboardButton(text="📄 Generate CSV",     callback_data="generate_csv"),
         ],
     ])
 
@@ -1072,6 +1126,11 @@ async def handle_upi_id(message: Message, state: FSMContext) -> None:
         )
         await state.clear()
         return
+
+    # ── FSM FIX: must transition to confirming BEFORE showing the Confirm
+    #    button so that cb_confirm_wd (which filters on WithdrawStates.confirming)
+    #    matches when Telegram delivers the callback on the next invocation. ──
+    await state.set_state(WithdrawStates.confirming)
 
     await message.answer(
         f"💳 <b>Confirm Withdrawal</b>\n\n"
@@ -2565,13 +2624,95 @@ async def cb_reject_wd(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.message()
 async def handle_fallback(message: Message, state: FSMContext) -> None:
-    if await state.get_state() is not None:
+    current = await state.get_state()
+    if current is not None:
+        # There IS an active state — don't show the menu.
+        # The specific state handler should have matched; if we land here
+        # it means the message type didn't match the state's expected filter
+        # (e.g. user sent text instead of a document).
+        logger.debug("Fallback hit but state is active: %s (uid=%s) — ignoring", current, message.from_user.id)
         return
+    # No active state — show the default menu
+    logger.info(
+        "Fallback: no FSM state for uid=%s, showing main menu. "
+        "(If the user was mid-flow, the state was lost — check FSM logs above)",
+        message.from_user.id,
+    )
     uid = message.from_user.id
     if uid == ADMIN_CHAT_ID:
         await message.answer("Use the panel below:", reply_markup=kb_admin_main())
     else:
         await message.answer("Use the menu below:", reply_markup=kb_user_main())
+
+
+# ─────────────────────────────────────────────
+#  ADMIN — GENERATE CSV FOR ADOBE STOCK
+# ─────────────────────────────────────────────
+
+@router.callback_query(F.data == "generate_csv")
+async def cb_generate_csv(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id != ADMIN_CHAT_ID:
+        await callback.answer("Unauthorized.", show_alert=True)
+        return
+
+    try:
+        await callback.answer("⏳ Generating CSV…")
+    except Exception:
+        pass
+
+    # Fetch ONLY downloaded submissions — no status changes made here
+    all_subs = await DB.get_all_submissions()
+    downloaded = sorted(
+        [v for v in all_subs.values() if isinstance(v, dict) and v.get("status") == "downloaded"],
+        key=lambda x: x.get("downloaded_at", x.get("date", "")),
+    )
+
+    if not downloaded:
+        await callback.message.answer(
+            "📄 <b>Generate CSV</b>\n\n"
+            "❌ Downloaded List is empty.\n"
+            "Mark images as Downloaded first, then generate CSV.",
+            parse_mode="HTML",
+            reply_markup=kb_admin_main(),
+        )
+        return
+
+    # ── Build CSV in memory ───────────────────────────────────────────────
+    # Adobe Stock required columns (case-sensitive, exact order)
+    output = io.StringIO()
+    writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
+
+    # EXACT headers required by Adobe Stock
+    writer.writerow(["Filename", "Title", "Keywords", "Category", "Releases"])
+
+    for sub in downloaded:
+        writer.writerow([
+            sub.get("file_name", ""),   # EXACT original filename (e.g. IMG_123.jpg)
+            sub.get("title",     ""),   # Title saved at upload time
+            sub.get("keywords",  ""),   # Keywords saved at upload time
+            "",                          # Category — blank as required
+            "",                          # Releases — blank as required
+        ])
+
+    # UTF-8 with BOM so Excel / Adobe Stock opens it correctly
+    csv_bytes = output.getvalue().encode("utf-8-sig")
+    output.close()
+
+    # ── Send CSV as document to admin chat ───────────────────────────────
+    timestamp = _now().replace(" ", "_").replace(":", "-")
+    filename  = f"adobe_stock_{timestamp}.csv"
+
+    await bot.send_document(
+        chat_id  = ADMIN_CHAT_ID,
+        document = BufferedInputFile(file=csv_bytes, filename=filename),
+        caption  = (
+            f"📄 <b>Adobe Stock CSV</b>\n\n"
+            f"✅ <b>{len(downloaded)}</b> items exported from Downloaded List.\n"
+            f"📅 Generated: {_now()}"
+        ),
+        parse_mode = "HTML",
+    )
+    logger.info("CSV generated: %s items → %s", len(downloaded), filename)
 
 
 # ─────────────────────────────────────────────
