@@ -34,7 +34,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
@@ -98,12 +98,9 @@ def _detect_proxy() -> Optional[str]:
 
     Resolution order:
     1. Respect any proxy already set in the environment (HTTPS_PROXY / HTTP_PROXY).
-    2. Try a direct TCP connection to api.telegram.org:443 — if it succeeds, no proxy
-       is needed (premium / open-internet server).
-    3. Fall back to the PythonAnywhere free-tier proxy.
-
-    This means the same code runs unchanged on free-tier (proxy required) and
-    paid/local environments (direct connection).
+    2. If running on Vercel (VERCEL env set), NEVER use PythonAnywhere proxy.
+    3. Try direct TCP connection to api.telegram.org:443.
+    4. Only fall back to PythonAnywhere proxy if on PythonAnywhere.
     """
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
         val = os.environ.get(key, "").strip()
@@ -111,18 +108,24 @@ def _detect_proxy() -> Optional[str]:
             logger.info("Proxy detected from environment variable %s=%s", key, val)
             return val
 
+    if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"):
+        logger.info("Vercel environment detected — direct connection forced (no proxy).")
+        return None
+
     try:
-        conn = socket.create_connection(("api.telegram.org", 443), timeout=5)
+        conn = socket.create_connection(("api.telegram.org", 443), timeout=3)
         conn.close()
         logger.info("Direct internet access confirmed — no proxy needed.")
         return None
     except OSError:
-        logger.info(
-            "Direct connection to api.telegram.org failed. "
-            "Falling back to PythonAnywhere proxy: %s",
-            _PYTHONANYWHERE_PROXY,
-        )
+        pass
+
+    if "PYTHONANYWHERE_DOMAIN" in os.environ or os.path.exists("/home/pythonanywhere"):
+        logger.info("PythonAnywhere environment detected — using proxy: %s", _PYTHONANYWHERE_PROXY)
         return _PYTHONANYWHERE_PROXY
+
+    logger.info("Direct connection test failed but not on PythonAnywhere — no proxy set.")
+    return None
 
 
 PROXY: Optional[str] = _detect_proxy()
@@ -413,63 +416,62 @@ class FirebaseFSMStorage(BaseStorage):
     """
 
     def _path(self, key: StorageKey) -> str:
-        return f"fsm/{key.bot_id}/{key.chat_id}/{key.user_id}"
+        bot_id = key.bot_id or (BOT_TOKEN.split(":")[0] if ":" in BOT_TOKEN else "default_bot")
+        user_id = key.user_id or key.chat_id
+        chat_id = key.chat_id or key.user_id
+        return f"fsm/{bot_id}/{chat_id}/{user_id}"
 
     async def set_state(self, key: StorageKey, state: StateType = None) -> None:
         path = f"{self._path(key)}/state"
         if state is None:
-            ok = await fb_set(path, None)
-            if not ok:
-                logger.warning("FSM set_state RETRY: clearing state at [%s]", path)
-                ok = await fb_set(path, None)
-            if not ok:
-                logger.error("FSM set_state FAILED: could not clear state at [%s]", path)
-            else:
-                logger.debug("FSM set_state: cleared [%s]", path)
+            state_str = None
+        elif isinstance(state, str):
+            state_str = state
+        elif hasattr(state, "state"):
+            state_str = state.state
         else:
-            state_str = state.state if hasattr(state, "state") else str(state)
+            state_str = str(state)
+
+        ok = await fb_set(path, state_str)
+        if not ok:
+            logger.warning("FSM set_state RETRY: [%s] → %s", path, state_str)
+            await asyncio.sleep(0.1)
             ok = await fb_set(path, state_str)
-            if not ok:
-                logger.warning("FSM set_state RETRY: [%s] → %s", path, state_str)
-                ok = await fb_set(path, state_str)
-            if not ok:
-                logger.error("FSM set_state FAILED: [%s] → %s — STATE WILL BE LOST!", path, state_str)
-            else:
-                logger.info("FSM set_state OK: [%s] → %s", path, state_str)
+
+        if ok:
+            logger.info("FSM set_state OK: [%s] → %s", path, state_str)
+        else:
+            logger.error("FSM set_state FAILED: [%s] → %s — STATE WILL BE LOST!", path, state_str)
 
     async def get_state(self, key: StorageKey) -> Optional[str]:
         path = f"{self._path(key)}/state"
         val = await fb_get(path)
-        if val is None:
-            logger.debug("FSM get_state: [%s] → None (no active state)", path)
-        elif isinstance(val, str):
+        if isinstance(val, str) and val.strip():
             logger.info("FSM get_state: [%s] → %s", path, val)
-        else:
-            logger.warning("FSM get_state: [%s] → unexpected type %s: %r", path, type(val).__name__, val)
-        return val if isinstance(val, str) else None
+            return val
+        logger.debug("FSM get_state: [%s] → None", path)
+        return None
 
     async def set_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
         path = f"{self._path(key)}/data"
         payload = data if data else {}
         ok = await fb_set(path, payload)
         if not ok:
-            logger.warning("FSM set_data RETRY: [%s] keys=%s", path, list(payload.keys()) if payload else "{}")
+            logger.warning("FSM set_data RETRY: [%s]", path)
+            await asyncio.sleep(0.1)
             ok = await fb_set(path, payload)
-        if not ok:
-            logger.error("FSM set_data FAILED: [%s] — DATA WILL BE LOST!", path)
+
+        if ok:
+            logger.debug("FSM set_data OK: [%s]", path)
         else:
-            logger.debug("FSM set_data OK: [%s] keys=%s", path, list(payload.keys()) if payload else "{}")
+            logger.error("FSM set_data FAILED: [%s]", path)
 
     async def get_data(self, key: StorageKey) -> Dict[str, Any]:
         path = f"{self._path(key)}/data"
         result = await fb_get(path)
-        if result is None:
-            logger.debug("FSM get_data: [%s] → None (returning empty dict)", path)
-            return {}
         if isinstance(result, dict):
             logger.debug("FSM get_data: [%s] → keys=%s", path, list(result.keys()))
             return result
-        logger.warning("FSM get_data: [%s] → unexpected type %s: %r (returning empty dict)", path, type(result).__name__, result)
         return {}
 
     async def close(self) -> None:
@@ -2620,24 +2622,16 @@ async def cb_reject_wd(callback: CallbackQuery, bot: Bot) -> None:
 
 # ─────────────────────────────────────────────
 #  FALLBACK HANDLER
+#  Uses StateFilter(None) so it ONLY fires when
+#  user explicitly has NO ACTIVE STATE.
 # ─────────────────────────────────────────────
 
-@router.message()
+@router.message(StateFilter(None))
 async def handle_fallback(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
     if current is not None:
-        # There IS an active state — don't show the menu.
-        # The specific state handler should have matched; if we land here
-        # it means the message type didn't match the state's expected filter
-        # (e.g. user sent text instead of a document).
-        logger.debug("Fallback hit but state is active: %s (uid=%s) — ignoring", current, message.from_user.id)
+        logger.debug("Fallback ignored because active state exists: %s (uid=%s)", current, message.from_user.id)
         return
-    # No active state — show the default menu
-    logger.info(
-        "Fallback: no FSM state for uid=%s, showing main menu. "
-        "(If the user was mid-flow, the state was lost — check FSM logs above)",
-        message.from_user.id,
-    )
     uid = message.from_user.id
     if uid == ADMIN_CHAT_ID:
         await message.answer("Use the panel below:", reply_markup=kb_admin_main())
